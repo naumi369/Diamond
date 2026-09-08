@@ -129,11 +129,45 @@ def save_master_excel(df: pd.DataFrame) -> str:
     try:
         buf = io.BytesIO()
         out = df.copy()
+        # Strip trailing .0 and keep as plain text IDs
+        import re as _re
+        def _id_str(v):
+            if v is None:
+                return None
+            try:
+                import pandas as _pd
+                if _pd.isna(v):
+                    return None
+            except Exception:
+                pass
+            if isinstance(v, float) and v == int(v):
+                return str(int(v))
+            if isinstance(v, int) and not isinstance(v, bool):
+                return str(v)
+            s = str(v).strip()
+            if s.lower() in ("", "nan", "none", "<na>"):
+                return None
+            if _re.match(r"^-?\d+\.0+$", s):
+                s = s.split(".")[0]
+            return s
         for col in ("certificate_no", "stock_no"):
             if col in out.columns:
-                out[col] = out[col].astype("string")
+                out[col] = out[col].map(_id_str)
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             out.to_excel(writer, index=False, sheet_name="Inventory")
+            # Force text format so Excel does not turn IDs into numbers (… .0)
+            ws = writer.sheets["Inventory"]
+            headers = {cell.value: cell.column for cell in ws[1]}
+            from openpyxl.styles import numbers
+            for col_name in ("certificate_no", "stock_no"):
+                if col_name not in headers:
+                    continue
+                col_idx = headers[col_name]
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=row, column=col_idx)
+                    if cell.value is not None:
+                        cell.number_format = numbers.FORMAT_TEXT
+                        cell.value = str(cell.value)
         content_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
         # Need current SHA to update an existing file

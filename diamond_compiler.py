@@ -163,20 +163,45 @@ def normalize_col(name: Any) -> str:
 
 
 def clean_value(val: Any) -> Optional[str]:
-    """Convert cell value to clean string or None."""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+    """Convert cell value to clean string or None.
+
+    Certificate / stock style IDs never keep a trailing '.0'.
+    """
+    if val is None:
         return None
-    # Keep large numbers (certificate IDs) as full integer strings
-    if isinstance(val, float) and val == int(val) and abs(val) > 1e6:
-        return str(int(val))
-    if isinstance(val, (int,)):
-        return str(val)
-    s = str(val).strip()
-    if s.lower() in ("", "nan", "none", "null", "-"):
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    # Integers / whole floats → plain digit string (no .0)
+    if isinstance(val, bool):
+        s = str(val)
+    elif isinstance(val, int) and not isinstance(val, bool):
+        s = str(val)
+    elif isinstance(val, float):
+        if val == int(val):
+            s = str(int(val))
+        else:
+            s = str(val)
+    else:
+        s = str(val).strip()
+
+    if s.lower() in ("", "nan", "none", "null", "-", "<na>", "nat"):
         return None
-    # Also catch scientific notation that already became a string
-    if re.match(r"^\d+\.0+$", s):
-        return s.split(".")[0]
+
+    # "12345.0", "12345.000", scientific-ish whole numbers
+    if re.match(r"^-?\d+\.0+$", s):
+        s = s.split(".")[0]
+    # Excel sometimes gives "1.535750439e+09"
+    if re.match(r"^-?\d+(\.\d+)?[eE][+]\d+$", s):
+        try:
+            f = float(s)
+            if f == int(f):
+                s = str(int(f))
+        except ValueError:
+            pass
     return s
 
 

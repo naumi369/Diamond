@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diamond_compiler import (  # noqa: E402
     STANDARD_COLUMNS,
     choose_parser,
+    clean_value,
     download_videos,
     is_url,
 )
@@ -64,6 +65,8 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
     df = df[STANDARD_COLUMNS].copy()
     for col in ("certificate_no", "stock_no"):
+        df[col] = df[col].map(clean_value)
+        # pandas StringDtype, blanks as <NA>
         df[col] = df[col].astype("string")
     return df
 
@@ -109,9 +112,21 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     out = df.copy()
     for col in ("certificate_no", "stock_no"):
         if col in out.columns:
-            out[col] = out[col].astype("string")
+            out[col] = out[col].map(clean_value)
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out.to_excel(writer, index=False, sheet_name="Inventory")
+        ws = writer.sheets["Inventory"]
+        headers = {cell.value: cell.column for cell in ws[1]}
+        from openpyxl.styles import numbers
+        for col_name in ("certificate_no", "stock_no"):
+            if col_name not in headers:
+                continue
+            col_idx = headers[col_name]
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row, column=col_idx)
+                if cell.value is not None:
+                    cell.number_format = numbers.FORMAT_TEXT
+                    cell.value = str(cell.value)
     return buf.getvalue()
 
 
@@ -479,17 +494,8 @@ with tab_inventory:
         edit_df = filtered[display_cols + ["_row_id"]].copy()
 
         def _as_str(v):
-            if v is None:
-                return ""
-            try:
-                if pd.isna(v):
-                    return ""
-            except (TypeError, ValueError):
-                pass
-            # avoid "12345.0" for cert-like numbers
-            if isinstance(v, float) and v == int(v):
-                return str(int(v))
-            return str(v)
+            cleaned = clean_value(v)
+            return "" if cleaned is None else cleaned
 
         # Coerce types so data_editor / Arrow never sees mixed object columns
         numeric_cols = {"weight", "price_per_ct", "amount"}
@@ -501,18 +507,18 @@ with tab_inventory:
             else:
                 edit_df[col] = edit_df[col].map(_as_str).astype("string")
 
-        # Highlight helper: mark missing cert rows with a visible flag column
+        # Red mark for missing certificate numbers
         miss_flags = edit_df["certificate_no"].map(
-            lambda v: "YES — enter below" if _is_blank_cert(v) else ""
+            lambda v: "🔴" if _is_blank_cert(v) else ""
         )
         edit_df.insert(0, "Missing Cert", miss_flags.astype("string"))
 
         column_config = {
             "Missing Cert": st.column_config.TextColumn(
-                "Missing Cert",
+                "🔴",
                 disabled=True,
                 width="small",
-                help="Filled when Certificate # is blank",
+                help="Red mark = Certificate # is missing — please enter it",
             ),
             "certificate_no": st.column_config.TextColumn(
                 "Certificate #",
@@ -572,10 +578,8 @@ with tab_inventory:
                         if col in row.index and col in base.columns:
                             val = row[col]
                             # normalize blank cert to None
-                            if col == "certificate_no" and _is_blank_cert(val):
-                                val = None
-                            elif col == "certificate_no" and val is not None:
-                                val = str(val).strip()
+                            if col in ("certificate_no", "stock_no"):
+                                val = clean_value(val)
                             base.at[i, col] = val
                 base = base.drop(columns=["_row_id"], errors="ignore")
                 st.session_state.inventory = _normalize_df(base)
@@ -605,10 +609,8 @@ with tab_inventory:
                         for col in editable_cols:
                             if col in row.index and col in base.columns:
                                 val = row[col]
-                                if col == "certificate_no" and _is_blank_cert(val):
-                                    val = None
-                                elif col == "certificate_no" and val is not None:
-                                    val = str(val).strip()
+                                if col in ("certificate_no", "stock_no"):
+                                    val = clean_value(val)
                                 base.at[i, col] = val
                     base = base.drop(columns=["_row_id"], errors="ignore")
                     st.session_state.inventory = _normalize_df(base)
