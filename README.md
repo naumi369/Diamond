@@ -1,10 +1,17 @@
 # Diamond Inventory Compiler
 
-A tool that takes miscellaneous Excel diamond lists from different customers / suppliers and merges them into **one clean, standardized inventory**.
+Compile miscellaneous customer/supplier diamond Excel lists into one clean inventory.
 
-## Two ways to use it
+Works **locally** and on **Streamlit Community Cloud**.
 
-### 1. GUI (recommended)
+## Features
+
+- **Upload & Add** – keep uploading new sheets; stones are merged and de-duplicated
+- **Full Inventory** – filterable table + download Master Excel / CSV
+- **Summary** – KPIs, charts, shape×color pivot, multi-sheet summary workbook
+- Video links stored; actual video files downloadable **locally only**
+
+## Run locally
 
 ```bash
 cd diamond_compiler
@@ -12,75 +19,47 @@ pip install -r requirements.txt
 streamlit run gui_app.py
 ```
 
-A browser window opens. Upload your Excel files, click **Compile Inventory**, and optionally download videos. Results appear on screen and are also written to the output folder.
+## Deploy to Streamlit Cloud
 
-### 2. Command line
+1. Push this folder to a **public GitHub repo** (or private if you have Streamlit team plan)
+2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
+3. Select the repo, branch, and set **Main file path** to `gui_app.py`
+4. Deploy
+
+`requirements.txt` is already set for Cloud.
+
+### Important Cloud limitations
+
+| Topic | Reality on Streamlit Cloud |
+|-------|----------------------------|
+| **Video files** | **Cannot be stored permanently.** Disk is wiped when the app sleeps. Video *links* stay in the table; open them in a browser. For real file downloads, run locally. |
+| **Inventory persistence** | Session memory is lost on restart. **Always download the Master Excel** and re-upload it next time together with new sheets. |
+| **File size** | Keep individual Excel uploads reasonable (< 200 MB total per session is safer). |
+
+## Recommended workflow (Cloud or local)
+
+1. Upload any previous **Master Excel** (optional first time)
+2. Upload new customer sheets
+3. Click **Process & Add to Inventory**
+4. Review **Full Inventory** and **Summary** tabs
+5. Download **Master Excel** and keep it safe
+6. Next batch: upload that Master + the new sheets again
+
+Duplicates are removed automatically (by certificate number, then stock number).
+
+## CLI (no GUI)
 
 ```bash
-python diamond_compiler.py \
-    --input-dir /path/to/excel/folder \
-    --output-dir /path/to/save/results \
-    --db \
-    --download-videos
+python diamond_compiler.py --input-dir ./sheets --output-dir ./output --db --download-videos
 ```
 
-| Flag | Meaning |
-|------|---------|
-| `--input-dir` | Folder with source `.xlsx` files |
-| `--output-dir` | Where compiled files are written |
-| `--db` | Also create SQLite database `diamonds.db` |
-| `--download-videos` | Download videos named by certificate number |
-| `-v` | Verbose logging |
-
-## Standard columns
-
-| Column | Description |
-|--------|-------------|
-| stock_no | Supplier / internal reference |
-| certificate_no | GIA (or other) report number |
-| lab | Laboratory (GIA, IGI, …) |
-| shape | Oval, Round, Pear, … |
-| weight | Carat weight |
-| mm_size | Measurements (L × W × D) |
-| color / clarity | Grades |
-| polish / symmetry / fluorescence / cut | Finish grades |
-| price_per_ct / amount | Pricing |
-| video_link / image_link / certificate_link | Links |
-| source_file | Original Excel the row came from |
-| notes | Placeholder text that was cleaned |
-
-## Video downloads
-
-When enabled, every stone that has a `video_link` is downloaded into:
+## Project layout
 
 ```
-output/videos/<certificate_no>.mp4
-# or
-output/videos/<certificate_no>.html
-```
-
-- **Direct media** (`.mp4`, `.webm`, …) → saved as media.
-- **Interactive 360° viewers** (v360, diamondview, etc.) → the HTML page is saved so you still have a local copy (you can open it in a browser).
-- Filename is always the **certificate number** (falls back to stock number).
-
-## Supported Excel layouts
-
-1. Simple customer lists (`Carat Size Range | Certificate | Shape | WEIGHT | …`)
-2. Ovals G VS2-SI1 style (`Ref.No | Cts. | Measurement | CertNo | …`)
-3. Complex market sheets (`Data_YYYY-…`) – finds the real header under the summary
-4. Generic auto-detect
-
-Just keep dropping new files into the input folder / uploader; the tool adapts.
-
-## Output location
-
-```
-diamond_compiler/output/
-├── compiled_diamonds_YYYYMMDD_HHMMSS.xlsx
-├── compiled_diamonds_YYYYMMDD_HHMMSS.csv
-├── diamonds.db
-└── videos/
-    ├── 1535750439.mp4
-    ├── 2547813803.html
-    └── …
+diamond_compiler/
+├── gui_app.py              ← Streamlit app (deploy this)
+├── diamond_compiler.py     ← parsing / download engine
+├── requirements.txt
+├── README.md
+└── output/                 ← local results & videos/
 ```

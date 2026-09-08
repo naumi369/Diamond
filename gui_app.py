@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """
-Diamond Inventory Compiler – GUI (Streamlit)
---------------------------------------------
-Run with:
+Diamond Inventory Compiler – Streamlit GUI
+------------------------------------------
+Designed for local use AND Streamlit Community Cloud deployment.
+
+Run locally:
     streamlit run gui_app.py
+
+Deploy: push this folder to GitHub and connect it at share.streamlit.io
 """
 
+from __future__ import annotations
+
+import hashlib
 import io
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
-# Make sure we can import the compiler sitting next to this file
+# ---------------------------------------------------------------------------
+# Import core compiler (same folder)
+# ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diamond_compiler import (  # noqa: E402
     STANDARD_COLUMNS,
     choose_parser,
     download_videos,
-    save_to_csv,
-    save_to_excel,
-    save_to_sqlite,
+    is_url,
 )
 
 # ---------------------------------------------------------------------------
-# Page config
+# Page setup
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Diamond Inventory Compiler",
@@ -36,177 +44,433 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("💎 Diamond Inventory Compiler")
-st.caption(
-    "Drop miscellaneous customer Excel lists → get one clean, standardized inventory. "
-    "Videos are saved as **&lt;certificate_no&gt;.mp4 / .html** in the output folder."
-)
-
 # ---------------------------------------------------------------------------
-# Sidebar – settings
+# Helpers
 # ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("Settings")
-    default_out = str(Path(__file__).resolve().parent / "output")
-    output_dir = st.text_input("Output folder", value=default_out)
-    save_db = st.checkbox("Also save SQLite database", value=True)
-    do_videos = st.checkbox(
-        "Download video links",
-        value=True,
-        help="Saves each video (or HTML viewer page) as <certificate_no>.ext inside a 'videos' sub-folder.",
-    )
-    st.markdown("---")
-    st.markdown(
-        "**Supported layouts**\n"
-        "- Simple customer lists (WEIGHT / Color / Clarity …)\n"
-        "- Ovals G VS2-SI1 style (Ref.No / CertNo …)\n"
-        "- Complex market sheets (Data_YYYY-…)\n"
-        "- Auto-detect generic Excel"
-    )
 
-# ---------------------------------------------------------------------------
-# File uploader
-# ---------------------------------------------------------------------------
-uploaded = st.file_uploader(
-    "Upload one or more diamond Excel files (.xlsx)",
-    type=["xlsx", "xls"],
-    accept_multiple_files=True,
-)
+def _empty_inventory() -> pd.DataFrame:
+    return pd.DataFrame(columns=STANDARD_COLUMNS)
 
-if not uploaded:
-    st.info("👆 Upload the Excel files you received from customers / suppliers to begin.")
-    st.stop()
 
-st.success(f"{len(uploaded)} file(s) ready: " + ", ".join(f.name for f in uploaded))
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure all standard columns exist and types are sane."""
+    for col in STANDARD_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    df = df[STANDARD_COLUMNS].copy()
+    for col in ("certificate_no", "stock_no"):
+        df[col] = df[col].astype("string")
+    return df
 
-# ---------------------------------------------------------------------------
-# Compile button
-# ---------------------------------------------------------------------------
-if st.button("🚀 Compile Inventory", type="primary", use_container_width=True):
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    videos_path = out_path / "videos"
 
-    progress = st.progress(0, text="Starting…")
-    log_box = st.empty()
-    logs: list[str] = []
+def _dedup(df: pd.DataFrame) -> pd.DataFrame:
+    """Prefer certificate_no, then stock_no, keep first occurrence."""
+    if df.empty:
+        return df
+    keys = []
+    for _, row in df.iterrows():
+        k = row.get("certificate_no")
+        if pd.isna(k) or str(k).strip() in ("", "nan", "<NA>"):
+            k = row.get("stock_no")
+        if pd.isna(k) or str(k).strip() in ("", "nan", "<NA>"):
+            k = f"_row_{hashlib.md5(str(row.values).encode()).hexdigest()[:12]}"
+        keys.append(str(k).strip())
+    df = df.copy()
+    df["_dedup_key"] = keys
+    df = df.drop_duplicates(subset=["_dedup_key"], keep="first")
+    return df.drop(columns=["_dedup_key"])
 
-    def log(msg: str):
-        logs.append(msg)
-        log_box.code("\n".join(logs[-30:]), language=None)
 
-    # ---- 1. Parse every uploaded file ----
-    all_records = []
+def _parse_uploaded_excels(files):
+    """Parse a list of Streamlit UploadedFile objects."""
+    records = []
+    logs = []
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        for i, uf in enumerate(uploaded):
-            progress.progress((i) / max(len(uploaded) + 2, 1), text=f"Parsing {uf.name}…")
+        for uf in files:
             local = tmp_path / uf.name
             local.write_bytes(uf.getvalue())
             try:
                 recs = choose_parser(local)
-                log(f"✓ {uf.name} → {len(recs)} stones")
-                all_records.extend(recs)
+                logs.append(f"✓ {uf.name} → {len(recs)} stones")
+                records.extend(recs)
             except Exception as e:
-                log(f"✗ {uf.name} failed: {e}")
+                logs.append(f"✗ {uf.name} failed: {e}")
+    return records, logs
 
-    if not all_records:
-        st.error("No stones could be extracted from the uploaded files.")
-        st.stop()
 
-    # ---- 2. Deduplicate ----
-    progress.progress(0.6, text="Deduplicating…")
-    seen = set()
-    unique = []
-    for r in all_records:
-        key = r.get("certificate_no") or r.get("stock_no") or id(r)
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-    log(f"Total unique stones: {len(unique)} (from {len(all_records)} raw rows)")
+def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    out = df.copy()
+    for col in ("certificate_no", "stock_no"):
+        if col in out.columns:
+            out[col] = out[col].astype("string")
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="Inventory")
+    return buf.getvalue()
 
-    # ---- 3. Save Excel / CSV / DB ----
-    progress.progress(0.75, text="Writing Excel & CSV…")
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_file = out_path / f"compiled_diamonds_{ts}.xlsx"
-    csv_file = out_path / f"compiled_diamonds_{ts}.csv"
-    save_to_excel(unique, excel_file)
-    save_to_csv(unique, csv_file)
-    log(f"Saved Excel → {excel_file.name}")
-    log(f"Saved CSV   → {csv_file.name}")
 
-    if save_db:
-        db_file = out_path / "diamonds.db"
-        save_to_sqlite(unique, db_file)
-        log(f"Saved SQLite → {db_file.name}")
+def _df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
-    # ---- 4. Download videos ----
-    video_stats = {"downloaded": 0, "already": 0, "failed": 0}
-    if do_videos:
-        progress.progress(0.85, text="Downloading videos…")
-        video_bar = st.progress(0, text="Videos…")
 
-        def video_progress(current, total, fname):
-            video_bar.progress(current / max(total, 1), text=f"Video {current}/{total}: {fname}")
+# ---------------------------------------------------------------------------
+# Session state bootstrap
+# ---------------------------------------------------------------------------
+if "inventory" not in st.session_state:
+    st.session_state.inventory = _empty_inventory()
+if "last_logs" not in st.session_state:
+    st.session_state.last_logs = []
+if "video_dir" not in st.session_state:
+    st.session_state.video_dir = str(
+        Path(__file__).resolve().parent / "output" / "videos"
+    )
 
-        video_stats = download_videos(unique, videos_path, progress_callback=video_progress)
-        log(
-            f"Videos: {video_stats.get('downloaded', 0)} new, "
-            f"{video_stats.get('already', 0)} already present, "
-            f"{video_stats.get('failed', 0)} failed"
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.title("💎 Diamond Compiler")
+    st.markdown("---")
+    st.markdown(
+        "**How to keep building inventory**\n\n"
+        "1. Upload new Excel sheets on the **Upload** tab\n"
+        "2. Stones are **added** to the inventory (duplicates removed)\n"
+        "3. Download the **Master Excel** regularly\n"
+        "4. Next session: re-upload that Master Excel + new sheets\n"
+    )
+    st.markdown("---")
+    with st.expander("☁️ Streamlit Cloud notes", expanded=False):
+        st.markdown(
+            """
+**Videos cannot be stored permanently on Streamlit Cloud.**
+The platform wipes the disk when the app sleeps or restarts.
+
+- Video **links** are kept in the inventory table
+- On Cloud, open videos in the browser via the link
+- For actual file downloads, run the app **locally**
+
+**Inventory persistence on Cloud:**
+Session memory is lost on restart. Always download the Master Excel
+and re-upload it next time.
+            """
         )
-        video_bar.empty()
+    st.markdown("---")
+    if st.button("🗑️ Clear inventory", use_container_width=True):
+        st.session_state.inventory = _empty_inventory()
+        st.session_state.last_logs = []
+        st.rerun()
 
-    progress.progress(1.0, text="Done!")
-    st.balloons()
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab_upload, tab_inventory, tab_summary = st.tabs(
+    ["📤 Upload & Add", "📋 Full Inventory", "📊 Summary"]
+)
 
-    # ---- Results summary ----
-    df = pd.DataFrame(unique, columns=STANDARD_COLUMNS)
+# ========================= TAB 1: Upload & Add =============================
+with tab_upload:
+    st.header("Upload sheets → add to inventory")
 
-    st.subheader("Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Unique stones", len(unique))
-    c2.metric("With video link", int(df["video_link"].notna().sum()))
-    c3.metric("Videos downloaded", video_stats.get("downloaded", 0) + video_stats.get("already", 0))
-    c4.metric("Source files", len(uploaded))
+    st.subheader("Optional: load previous Master Excel")
+    st.caption(
+        "If you already have a compiled master file from a previous session, "
+        "upload it here first so new stones are merged into it."
+    )
+    master_file = st.file_uploader(
+        "Master inventory Excel (optional)",
+        type=["xlsx", "xls", "csv"],
+        key="master_uploader",
+    )
 
-    st.markdown("#### Breakdown")
-    col_a, col_b, col_c = st.columns(3)
+    st.subheader("New customer / supplier sheets")
+    new_files = st.file_uploader(
+        "Upload one or more diamond Excel files",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        key="new_uploader",
+    )
+
+    col_a, col_b = st.columns(2)
     with col_a:
-        st.write("**Shape**")
-        st.dataframe(df["shape"].value_counts(dropna=False).rename("count"), use_container_width=True)
+        do_videos = st.checkbox(
+            "Download videos (local only)",
+            value=False,
+            help=(
+                "Works on your own computer. On Streamlit Cloud the files "
+                "are temporary and disappear when the app restarts."
+            ),
+        )
     with col_b:
-        st.write("**Color**")
-        st.dataframe(df["color"].value_counts(dropna=False).rename("count"), use_container_width=True)
-    with col_c:
-        st.write("**Clarity**")
-        st.dataframe(df["clarity"].value_counts(dropna=False).rename("count"), use_container_width=True)
+        replace_mode = st.checkbox(
+            "Replace inventory instead of adding",
+            value=False,
+            help="If checked, the current inventory is wiped before adding these files.",
+        )
 
-    st.markdown("#### Compiled data (preview)")
-    st.dataframe(df, use_container_width=True, height=400)
+    if st.button("🚀 Process & Add to Inventory", type="primary", use_container_width=True):
+        if master_file is None and not new_files:
+            st.warning("Please upload at least one file.")
+            st.stop()
 
-    # Download buttons for the generated files
-    st.markdown("#### Download results")
-    d1, d2 = st.columns(2)
-    with d1:
-        with open(excel_file, "rb") as f:
+        progress = st.progress(0, text="Working…")
+        all_new = []
+        logs = []
+
+        # --- Load master if provided ---
+        master_df = _empty_inventory()
+        if master_file is not None:
+            progress.progress(0.1, text="Loading master inventory…")
+            try:
+                if master_file.name.lower().endswith(".csv"):
+                    master_df = pd.read_csv(master_file)
+                else:
+                    master_df = pd.read_excel(master_file)
+                master_df = _normalize_df(master_df)
+                logs.append(f"✓ Master loaded → {len(master_df)} stones")
+            except Exception as e:
+                logs.append(f"✗ Master failed: {e}")
+                st.error(f"Could not read master file: {e}")
+                st.stop()
+
+        # --- Parse new sheets ---
+        if new_files:
+            progress.progress(0.3, text="Parsing new sheets…")
+            recs, parse_logs = _parse_uploaded_excels(new_files)
+            logs.extend(parse_logs)
+            all_new.extend(recs)
+
+        progress.progress(0.6, text="Merging & deduplicating…")
+        new_df = (
+            pd.DataFrame(all_new, columns=STANDARD_COLUMNS)
+            if all_new
+            else _empty_inventory()
+        )
+        new_df = _normalize_df(new_df)
+
+        if replace_mode:
+            combined = new_df if not new_df.empty else master_df
+        else:
+            pieces = []
+            if not master_df.empty:
+                pieces.append(master_df)
+            if not st.session_state.inventory.empty and master_file is None:
+                pieces.append(st.session_state.inventory)
+            if not new_df.empty:
+                pieces.append(new_df)
+            combined = (
+                pd.concat(pieces, ignore_index=True) if pieces else _empty_inventory()
+            )
+
+        before = len(combined)
+        combined = _dedup(combined)
+        after = len(combined)
+        logs.append(
+            f"Merged total: {after} unique stones (removed {before - after} duplicates)"
+        )
+
+        st.session_state.inventory = combined
+        st.session_state.last_logs = logs
+
+        # --- Optional video download (local) ---
+        if do_videos and not combined.empty:
+            progress.progress(0.8, text="Downloading videos…")
+            video_dir = Path(st.session_state.video_dir)
+            video_dir.mkdir(parents=True, exist_ok=True)
+            records = combined.to_dict(orient="records")
+            with_links = [r for r in records if is_url(r.get("video_link"))]
+            if with_links:
+                vbar = st.progress(0, text="Videos…")
+
+                def vprog(cur, tot, name):
+                    vbar.progress(cur / max(tot, 1), text=f"Video {cur}/{tot}: {name}")
+
+                stats = download_videos(with_links, video_dir, progress_callback=vprog)
+                logs.append(
+                    f"Videos → {stats.get('downloaded', 0)} new, "
+                    f"{stats.get('already', 0)} already, "
+                    f"{stats.get('failed', 0)} failed"
+                )
+                vbar.empty()
+            else:
+                logs.append("No video URLs found to download.")
+
+        progress.progress(1.0, text="Done!")
+        st.session_state.last_logs = logs
+        st.success(f"Inventory now has **{len(st.session_state.inventory)}** unique stones.")
+        for line in logs:
+            st.text(line)
+
+    if st.session_state.last_logs and not st.session_state.inventory.empty:
+        with st.expander("Last processing log"):
+            for line in st.session_state.last_logs:
+                st.text(line)
+
+# ========================= TAB 2: Full Inventory ===========================
+with tab_inventory:
+    st.header("Full Inventory")
+    inv = st.session_state.inventory
+
+    if inv.empty:
+        st.info("Inventory is empty. Go to **Upload & Add** to load sheets.")
+    else:
+        st.caption(f"{len(inv)} stones currently in memory")
+
+        with st.expander("🔍 Filters", expanded=False):
+            fcols = st.columns(4)
+            shapes = sorted([s for s in inv["shape"].dropna().unique()])
+            colors = sorted([c for c in inv["color"].dropna().unique()])
+            clarities = sorted([c for c in inv["clarity"].dropna().unique()])
+            sources = sorted([s for s in inv["source_file"].dropna().unique()])
+
+            sel_shape = fcols[0].multiselect("Shape", shapes, default=shapes)
+            sel_color = fcols[1].multiselect("Color", colors, default=colors)
+            sel_clarity = fcols[2].multiselect("Clarity", clarities, default=clarities)
+            sel_source = fcols[3].multiselect("Source file", sources, default=sources)
+
+            wmin = float(inv["weight"].min()) if inv["weight"].notna().any() else 0.0
+            wmax = float(inv["weight"].max()) if inv["weight"].notna().any() else 10.0
+            weight_range = st.slider("Weight (ct)", wmin, wmax, (wmin, wmax))
+
+        filtered = inv.copy()
+        if sel_shape:
+            filtered = filtered[filtered["shape"].isin(sel_shape)]
+        if sel_color:
+            filtered = filtered[filtered["color"].isin(sel_color)]
+        if sel_clarity:
+            filtered = filtered[filtered["clarity"].isin(sel_clarity)]
+        if sel_source:
+            filtered = filtered[filtered["source_file"].isin(sel_source)]
+        filtered = filtered[
+            (filtered["weight"].fillna(0) >= weight_range[0])
+            & (filtered["weight"].fillna(0) <= weight_range[1])
+        ]
+
+        st.dataframe(filtered, use_container_width=True, height=480)
+
+        st.markdown("#### Download")
+        d1, d2, d3 = st.columns(3)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with d1:
             st.download_button(
-                "📥 Download Excel",
-                data=f,
-                file_name=excel_file.name,
+                "📥 Master Excel (all)",
+                data=_df_to_excel_bytes(inv),
+                file_name=f"master_diamonds_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-    with d2:
-        with open(csv_file, "rb") as f:
+        with d2:
             st.download_button(
-                "📥 Download CSV",
-                data=f,
-                file_name=csv_file.name,
+                "📥 Master CSV (all)",
+                data=_df_to_csv_bytes(inv),
+                file_name=f"master_diamonds_{ts}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
+        with d3:
+            st.download_button(
+                "📥 Filtered Excel",
+                data=_df_to_excel_bytes(filtered),
+                file_name=f"filtered_diamonds_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                disabled=filtered.empty,
+            )
 
-    st.info(f"All files also saved on disk under:\n`{out_path}`")
-    if do_videos:
-        st.info(f"Videos saved under:\n`{videos_path}`  (named by certificate number)")
+# ========================= TAB 3: Summary ==================================
+with tab_summary:
+    st.header("Summary Dashboard")
+    inv = st.session_state.inventory
+
+    if inv.empty:
+        st.info("Inventory is empty. Go to **Upload & Add** to load sheets.")
+    else:
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total stones", len(inv))
+        k2.metric("Total carats", f"{inv['weight'].sum():.2f}")
+        avg_price = inv["price_per_ct"].mean()
+        k3.metric("Avg $/ct", f"{avg_price:,.0f}" if pd.notna(avg_price) else "—")
+        total_val = inv["amount"].sum()
+        if not total_val or pd.isna(total_val) or total_val == 0:
+            total_val = (inv["weight"] * inv["price_per_ct"]).sum()
+        k4.metric("Est. total value", f"${total_val:,.0f}" if pd.notna(total_val) else "—")
+        with_video = inv["video_link"].notna().sum()
+        k5.metric("With video link", int(with_video))
+
+        st.markdown("---")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.subheader("By Shape")
+            shape_ct = (
+                inv.groupby("shape", dropna=False)
+                .agg(stones=("weight", "count"), carats=("weight", "sum"))
+                .reset_index()
+                .sort_values("stones", ascending=False)
+            )
+            st.dataframe(shape_ct, use_container_width=True, hide_index=True)
+            st.bar_chart(shape_ct.set_index("shape")["stones"])
+
+        with c2:
+            st.subheader("By Color")
+            color_ct = (
+                inv.groupby("color", dropna=False)
+                .agg(stones=("weight", "count"), carats=("weight", "sum"))
+                .reset_index()
+                .sort_values("stones", ascending=False)
+            )
+            st.dataframe(color_ct, use_container_width=True, hide_index=True)
+            st.bar_chart(color_ct.set_index("color")["stones"])
+
+        with c3:
+            st.subheader("By Clarity")
+            clar_ct = (
+                inv.groupby("clarity", dropna=False)
+                .agg(stones=("weight", "count"), carats=("weight", "sum"))
+                .reset_index()
+                .sort_values("stones", ascending=False)
+            )
+            st.dataframe(clar_ct, use_container_width=True, hide_index=True)
+            st.bar_chart(clar_ct.set_index("clarity")["stones"])
+
+        st.markdown("---")
+        st.subheader("Shape × Color pivot (stone count)")
+        try:
+            pivot = pd.crosstab(
+                inv["shape"].fillna("(blank)"),
+                inv["color"].fillna("(blank)"),
+                margins=True,
+                margins_name="Total",
+            )
+            st.dataframe(pivot, use_container_width=True)
+        except Exception:
+            st.write("Not enough data for pivot.")
+
+        st.subheader("By source file")
+        src = (
+            inv.groupby("source_file", dropna=False)
+            .agg(stones=("weight", "count"), carats=("weight", "sum"))
+            .reset_index()
+            .sort_values("stones", ascending=False)
+        )
+        st.dataframe(src, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Download summary workbook")
+        summary_buf = io.BytesIO()
+        with pd.ExcelWriter(summary_buf, engine="openpyxl") as writer:
+            inv.to_excel(writer, sheet_name="Full Inventory", index=False)
+            shape_ct.to_excel(writer, sheet_name="By Shape", index=False)
+            color_ct.to_excel(writer, sheet_name="By Color", index=False)
+            clar_ct.to_excel(writer, sheet_name="By Clarity", index=False)
+            src.to_excel(writer, sheet_name="By Source", index=False)
+            try:
+                pivot.to_excel(writer, sheet_name="Shape x Color")
+            except Exception:
+                pass
+        st.download_button(
+            "📥 Download Summary Workbook (multi-sheet Excel)",
+            data=summary_buf.getvalue(),
+            file_name=f"diamond_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
