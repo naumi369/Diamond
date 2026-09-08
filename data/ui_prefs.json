@@ -1,7 +1,6 @@
 {
   "column_order": [
     "certificate_no",
-    "stock_no",
     "shape",
     "weight",
     "color",
