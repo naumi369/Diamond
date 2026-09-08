@@ -215,28 +215,18 @@ Then the app can load & save the master Excel in your repo automatically.
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_upload, tab_inventory, tab_summary = st.tabs(
-    ["📤 Upload & Add", "📋 Full Inventory", "📊 Summary"]
+tab_inventory, tab_upload, tab_summary = st.tabs(
+    ["📋 Full Inventory", "📤 Upload & Add", "📊 Summary"]
 )
 
-# ========================= TAB 1: Upload & Add =============================
+# ========================= TAB: Upload & Add =============================
 with tab_upload:
     st.header("Upload sheets → add to inventory")
 
-    st.subheader("Optional: load previous Master Excel")
-    st.caption(
-        "If you already have a compiled master file from a previous session, "
-        "upload it here first so new stones are merged into it."
-    )
-    master_file = st.file_uploader(
-        "Master inventory Excel (optional)",
-        type=["xlsx", "xls", "csv"],
-        key="master_uploader",
-    )
-
     st.subheader("New customer / supplier sheets")
+    st.caption("Upload one or more Excel lists from customers or suppliers.")
     new_files = st.file_uploader(
-        "Upload one or more diamond Excel files",
+        "Upload diamond Excel files",
         type=["xlsx", "xls"],
         accept_multiple_files=True,
         key="new_uploader",
@@ -257,6 +247,17 @@ with tab_upload:
             "Replace inventory instead of adding",
             value=False,
             help="If checked, the current inventory is wiped before adding these files.",
+        )
+
+    with st.expander("Optional: load previous Master Excel", expanded=False):
+        st.caption(
+            "Only needed if GitHub storage is not set up. "
+            "Upload a previously downloaded master file to merge into."
+        )
+        master_file = st.file_uploader(
+            "Master inventory Excel (optional)",
+            type=["xlsx", "xls", "csv"],
+            key="master_uploader",
         )
 
     if st.button("🚀 Process & Add to Inventory", type="primary", use_container_width=True):
@@ -368,7 +369,7 @@ with tab_upload:
             for line in st.session_state.last_logs:
                 st.text(line)
 
-# ========================= TAB 2: Full Inventory ===========================
+# ========================= TAB: Full Inventory ===========================
 with tab_inventory:
     st.header("Full Inventory")
     inv = st.session_state.inventory
@@ -439,7 +440,7 @@ with tab_inventory:
                 disabled=filtered.empty,
             )
 
-# ========================= TAB 3: Summary ==================================
+# ========================= TAB: Summary ==================================
 with tab_summary:
     st.header("Summary Dashboard")
     inv = st.session_state.inventory
