@@ -37,7 +37,9 @@ from diamond_compiler import (  # noqa: E402
 from github_storage import (  # noqa: E402
     is_configured as github_configured,
     load_master_excel,
+    load_ui_prefs,
     save_master_excel,
+    save_ui_prefs,
 )
 
 # ---------------------------------------------------------------------------
@@ -149,14 +151,35 @@ if "github_loaded" not in st.session_state:
     st.session_state.github_loaded = False
 if "github_status" not in st.session_state:
     st.session_state.github_status = ""
+if "column_order" not in st.session_state:
+    st.session_state.column_order = [
+        "certificate_no", "stock_no", "shape", "weight", "color", "clarity",
+        "mm_size", "lab", "polish", "symmetry", "fluorescence", "cut",
+        "price_per_ct", "amount", "video_link", "image_link",
+        "certificate_link", "source_file", "notes",
+    ]
+if "prefs_loaded" not in st.session_state:
+    st.session_state.prefs_loaded = False
 
-# Auto-load master inventory from GitHub once when secrets are present
+# Auto-load master inventory + UI prefs from GitHub once when secrets are present
 if not st.session_state.github_loaded and github_configured():
     df_gh, msg = load_master_excel()
     st.session_state.github_status = msg
     st.session_state.github_loaded = True
     if df_gh is not None and not df_gh.empty:
         st.session_state.inventory = _normalize_df(df_gh)
+
+if not st.session_state.prefs_loaded:
+    st.session_state.prefs_loaded = True
+    if github_configured():
+        prefs = load_ui_prefs()
+        saved_order = prefs.get("column_order")
+        if isinstance(saved_order, list) and saved_order:
+            known = [c for c in saved_order if c in STANDARD_COLUMNS]
+            for c in STANDARD_COLUMNS:
+                if c not in known:
+                    known.append(c)
+            st.session_state.column_order = known
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -535,7 +558,53 @@ with tab_inventory:
             "_row_id": st.column_config.NumberColumn("_row_id", disabled=True),
         }
 
-        col_order = ["Missing Cert"] + [c for c in display_cols]
+        # Build column order from saved prefs (Missing Cert always first)
+        preferred = st.session_state.column_order
+        ordered_display = [c for c in preferred if c in display_cols]
+        for c in display_cols:
+            if c not in ordered_display:
+                ordered_display.append(c)
+        col_order = ["Missing Cert"] + ordered_display
+
+        with st.expander("⚙️ Column order (saved on GitHub)", expanded=False):
+            st.caption(
+                "Pick columns in the order you want them to appear. "
+                "Click **Save column order** so it is remembered after restart."
+            )
+            new_order = st.multiselect(
+                "Visible column order",
+                options=list(STANDARD_COLUMNS),
+                default=[c for c in st.session_state.column_order if c in STANDARD_COLUMNS],
+                help="Order of selection = left-to-right order in the table",
+                key="col_order_picker",
+            )
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("💾 Save column order", use_container_width=True):
+                    if new_order:
+                        # append any missing standard cols at end
+                        full = list(new_order)
+                        for c in STANDARD_COLUMNS:
+                            if c not in full:
+                                full.append(c)
+                        st.session_state.column_order = full
+                        if github_configured():
+                            msg = save_ui_prefs({"column_order": full})
+                            st.success(msg)
+                        else:
+                            st.success("Column order saved for this session (configure GitHub to keep it after restart).")
+                        st.rerun()
+            with b2:
+                if st.button("↺ Reset default order", use_container_width=True):
+                    st.session_state.column_order = [
+                        "certificate_no", "stock_no", "shape", "weight", "color", "clarity",
+                        "mm_size", "lab", "polish", "symmetry", "fluorescence", "cut",
+                        "price_per_ct", "amount", "video_link", "image_link",
+                        "certificate_link", "source_file", "notes",
+                    ]
+                    if github_configured():
+                        save_ui_prefs({"column_order": st.session_state.column_order})
+                    st.rerun()
 
         st.markdown(
             "Edit **Certificate #** (and other fields) directly in the grid. "

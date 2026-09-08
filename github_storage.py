@@ -43,6 +43,11 @@ def _secrets() -> Dict[str, str]:
     repo = sec.get("GITHUB_REPO") or sec.get("github_repo")
     branch = sec.get("GITHUB_BRANCH") or sec.get("github_branch") or "main"
     path = sec.get("GITHUB_PATH") or sec.get("github_path") or "data/master_diamonds.xlsx"
+    prefs_path = (
+        sec.get("GITHUB_PREFS_PATH")
+        or sec.get("github_prefs_path")
+        or "data/ui_prefs.json"
+    )
 
     # Nested [github] table
     if not token and "github" in sec:
@@ -51,6 +56,7 @@ def _secrets() -> Dict[str, str]:
         repo = g.get("repo") or repo
         branch = g.get("branch") or branch
         path = g.get("path") or path
+        prefs_path = g.get("prefs_path") or prefs_path
 
     out = {}
     if token:
@@ -61,6 +67,8 @@ def _secrets() -> Dict[str, str]:
         out["branch"] = str(branch).strip()
     if path:
         out["path"] = str(path).strip()
+    if prefs_path:
+        out["prefs_path"] = str(prefs_path).strip()
     return out
 
 
@@ -194,3 +202,52 @@ def save_master_excel(df: pd.DataFrame) -> str:
         return f"GitHub save failed ({r.status_code}): {r.text[:500]}"
     except Exception as e:
         return f"GitHub save failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# UI preferences (column order, etc.)
+# ---------------------------------------------------------------------------
+
+import json
+
+
+def load_ui_prefs() -> Dict[str, Any]:
+    """Load UI prefs JSON from GitHub. Returns {} if missing/unavailable."""
+    s = _secrets()
+    if not s.get("token") or not s.get("repo"):
+        return {}
+    try:
+        raw, _sha = _get_file(s["repo"], s["prefs_path"], s["branch"], s["token"])
+        if raw is None:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def save_ui_prefs(prefs: Dict[str, Any]) -> str:
+    """Save UI prefs JSON to GitHub."""
+    s = _secrets()
+    if not s.get("token") or not s.get("repo"):
+        return "GitHub secrets not configured – cannot save preferences"
+
+    try:
+        content_b64 = base64.b64encode(
+            json.dumps(prefs, indent=2).encode("utf-8")
+        ).decode("ascii")
+        _, sha = _get_file(s["repo"], s["prefs_path"], s["branch"], s["token"])
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        payload: Dict[str, Any] = {
+            "message": f"Update UI preferences – {ts}",
+            "content": content_b64,
+            "branch": s["branch"],
+        }
+        if sha:
+            payload["sha"] = sha
+        url = f"{API}/repos/{s['repo']}/contents/{s['prefs_path']}"
+        r = requests.put(url, headers=_headers(s["token"]), json=payload, timeout=60)
+        if r.status_code in (200, 201):
+            return f"Preferences saved to GitHub → {s['prefs_path']}"
+        return f"Prefs save failed ({r.status_code}): {r.text[:300]}"
+    except Exception as e:
+        return f"Prefs save failed: {e}"
