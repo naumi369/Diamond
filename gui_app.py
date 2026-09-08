@@ -377,47 +377,235 @@ with tab_inventory:
     if inv.empty:
         st.info("Inventory is empty. Go to **Upload & Add** to load sheets.")
     else:
-        st.caption(f"{len(inv)} stones currently in memory")
+        # ---- helpers for missing cert detection ----
+        def _is_blank_cert(val) -> bool:
+            if val is None:
+                return True
+            try:
+                if pd.isna(val):
+                    return True
+            except (TypeError, ValueError):
+                pass
+            s = str(val).strip().lower()
+            return s in ("", "nan", "none", "null", "<na>", "nat")
 
-        with st.expander("🔍 Filters", expanded=False):
+        inv = inv.copy()
+        inv["_row_id"] = range(len(inv))  # stable id for editing merges
+        missing_mask = inv["certificate_no"].map(_is_blank_cert)
+        n_missing = int(missing_mask.sum())
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total stones", len(inv))
+        m2.metric("Missing Certificate #", n_missing)
+
+        if n_missing:
+            st.warning(
+                f"**{n_missing} stone(s) have no Certificate #.** "
+                "Those rows are highlighted below — enter the certificate number in the "
+                "**Certificate #** column, then click **Apply certificate edits**."
+            )
+
+        # ---- Search + filters (every column) ----
+        st.subheader("Search & filters")
+        search = st.text_input(
+            "🔍 Search all columns (keywords, certificate, stock, shape, links…)",
+            placeholder="e.g. oval SI1  or  1535750439  or  GIA",
+            key="inv_search",
+        )
+
+        with st.expander("Column filters", expanded=False):
             fcols = st.columns(4)
-            shapes = sorted([s for s in inv["shape"].dropna().unique()])
-            colors = sorted([c for c in inv["color"].dropna().unique()])
-            clarities = sorted([c for c in inv["clarity"].dropna().unique()])
-            sources = sorted([s for s in inv["source_file"].dropna().unique()])
+            shapes = sorted([str(s) for s in inv["shape"].dropna().unique()])
+            colors = sorted([str(c) for c in inv["color"].dropna().unique()])
+            clarities = sorted([str(c) for c in inv["clarity"].dropna().unique()])
+            sources = sorted([str(s) for s in inv["source_file"].dropna().unique()])
+            labs = sorted([str(s) for s in inv["lab"].dropna().unique()]) if "lab" in inv.columns else []
+            polishes = sorted([str(s) for s in inv["polish"].dropna().unique()]) if "polish" in inv.columns else []
 
-            sel_shape = fcols[0].multiselect("Shape", shapes, default=shapes)
-            sel_color = fcols[1].multiselect("Color", colors, default=colors)
-            sel_clarity = fcols[2].multiselect("Clarity", clarities, default=clarities)
-            sel_source = fcols[3].multiselect("Source file", sources, default=sources)
+            sel_shape = fcols[0].multiselect("Shape", shapes, default=[])
+            sel_color = fcols[1].multiselect("Color", colors, default=[])
+            sel_clarity = fcols[2].multiselect("Clarity", clarities, default=[])
+            sel_source = fcols[3].multiselect("Source file", sources, default=[])
+
+            fcols2 = st.columns(4)
+            sel_lab = fcols2[0].multiselect("Lab", labs, default=[]) if labs else []
+            sel_polish = fcols2[1].multiselect("Polish", polishes, default=[]) if polishes else []
+            only_missing = fcols2[2].checkbox("Only missing Certificate #", value=False)
+            only_video = fcols2[3].checkbox("Only with video link", value=False)
 
             wmin = float(inv["weight"].min()) if inv["weight"].notna().any() else 0.0
             wmax = float(inv["weight"].max()) if inv["weight"].notna().any() else 10.0
+            if wmin == wmax:
+                wmax = wmin + 0.01
             weight_range = st.slider("Weight (ct)", wmin, wmax, (wmin, wmax))
 
+        # Apply filters
         filtered = inv.copy()
+        if search and search.strip():
+            tokens = [t.strip().lower() for t in search.split() if t.strip()]
+            # every token must appear somewhere in the row (AND across tokens)
+            def row_match(row) -> bool:
+                blob = " ".join("" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v) for v in row.values).lower()
+                return all(tok in blob for tok in tokens)
+
+            filtered = filtered[filtered.apply(row_match, axis=1)]
+
         if sel_shape:
-            filtered = filtered[filtered["shape"].isin(sel_shape)]
+            filtered = filtered[filtered["shape"].astype(str).isin(sel_shape)]
         if sel_color:
-            filtered = filtered[filtered["color"].isin(sel_color)]
+            filtered = filtered[filtered["color"].astype(str).isin(sel_color)]
         if sel_clarity:
-            filtered = filtered[filtered["clarity"].isin(sel_clarity)]
+            filtered = filtered[filtered["clarity"].astype(str).isin(sel_clarity)]
         if sel_source:
-            filtered = filtered[filtered["source_file"].isin(sel_source)]
+            filtered = filtered[filtered["source_file"].astype(str).isin(sel_source)]
+        if sel_lab:
+            filtered = filtered[filtered["lab"].astype(str).isin(sel_lab)]
+        if sel_polish:
+            filtered = filtered[filtered["polish"].astype(str).isin(sel_polish)]
+        if only_missing:
+            filtered = filtered[filtered["certificate_no"].map(_is_blank_cert)]
+        if only_video:
+            filtered = filtered[filtered["video_link"].map(lambda v: is_url(v))]
         filtered = filtered[
             (filtered["weight"].fillna(0) >= weight_range[0])
             & (filtered["weight"].fillna(0) <= weight_range[1])
         ]
 
-        st.dataframe(filtered, use_container_width=True, height=480)
+        m3.metric("Shown after filters", len(filtered))
+        st.caption(f"Showing **{len(filtered)}** of **{len(inv)}** stones")
+
+        # ---- Editable table (certificate_no always editable) ----
+        display_cols = [c for c in STANDARD_COLUMNS if c in filtered.columns]
+        edit_df = filtered[display_cols + ["_row_id"]].copy()
+
+        # Highlight helper: mark missing cert rows with a visible flag column
+        edit_df.insert(
+            0,
+            "⚠ Missing Cert",
+            edit_df["certificate_no"].map(lambda v: "YES — enter below" if _is_blank_cert(v) else ""),
+        )
+
+        column_config = {
+            "⚠ Missing Cert": st.column_config.TextColumn(
+                "⚠ Missing Cert",
+                disabled=True,
+                width="small",
+                help="Highlighted when Certificate # is blank",
+            ),
+            "certificate_no": st.column_config.TextColumn(
+                "Certificate #",
+                required=False,
+                help="Mandatory — enter GIA/IGI report number",
+                width="medium",
+            ),
+            "stock_no": st.column_config.TextColumn("Stock #", width="medium"),
+            "weight": st.column_config.NumberColumn("Weight", format="%.2f"),
+            "price_per_ct": st.column_config.NumberColumn("Price/ct", format="%.2f"),
+            "amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+            "video_link": st.column_config.TextColumn("Video link", width="medium"),
+            "image_link": st.column_config.TextColumn("Image link", width="medium"),
+            "certificate_link": st.column_config.TextColumn("Cert link", width="medium"),
+        }
+
+        # column order without technical id
+        col_order = ["⚠ Missing Cert"] + [c for c in display_cols]
+
+        st.markdown(
+            "Edit **Certificate #** (and other fields) directly in the grid. "
+            "Then click **Apply edits** to save into the inventory."
+        )
+        edited = st.data_editor(
+            edit_df,
+            use_container_width=True,
+            height=480,
+            hide_index=True,
+            num_rows="fixed",
+            column_config=column_config,
+            column_order=col_order,
+            disabled=[c for c in edit_df.columns if c not in (
+                "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
+                "polish", "symmetry", "fluorescence", "cut", "notes",
+                "video_link", "image_link", "certificate_link", "mm_size",
+            )],
+            key="inventory_editor",
+        )
+
+        c_apply, c_save = st.columns(2)
+        with c_apply:
+            if st.button("✅ Apply edits to inventory", type="primary", use_container_width=True):
+                # Merge edited rows back into full inventory by _row_id
+                base = st.session_state.inventory.copy()
+                base["_row_id"] = range(len(base))
+                editable_cols = [
+                    "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
+                    "polish", "symmetry", "fluorescence", "cut", "notes",
+                    "video_link", "image_link", "certificate_link", "mm_size",
+                ]
+                for _, row in edited.iterrows():
+                    rid = row["_row_id"]
+                    idx = base.index[base["_row_id"] == rid]
+                    if len(idx) == 0:
+                        continue
+                    i = idx[0]
+                    for col in editable_cols:
+                        if col in row.index and col in base.columns:
+                            val = row[col]
+                            # normalize blank cert to None
+                            if col == "certificate_no" and _is_blank_cert(val):
+                                val = None
+                            elif col == "certificate_no" and val is not None:
+                                val = str(val).strip()
+                            base.at[i, col] = val
+                base = base.drop(columns=["_row_id"], errors="ignore")
+                st.session_state.inventory = _normalize_df(base)
+                still = st.session_state.inventory["certificate_no"].map(_is_blank_cert).sum()
+                if still:
+                    st.warning(f"Edits applied. **{int(still)}** stone(s) still missing Certificate #.")
+                else:
+                    st.success("Edits applied. All stones have a Certificate #.")
+                st.rerun()
+
+        with c_save:
+            if github_configured():
+                if st.button("💾 Apply edits & save to GitHub", use_container_width=True):
+                    base = st.session_state.inventory.copy()
+                    base["_row_id"] = range(len(base))
+                    editable_cols = [
+                        "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
+                        "polish", "symmetry", "fluorescence", "cut", "notes",
+                        "video_link", "image_link", "certificate_link", "mm_size",
+                    ]
+                    for _, row in edited.iterrows():
+                        rid = row["_row_id"]
+                        idx = base.index[base["_row_id"] == rid]
+                        if len(idx) == 0:
+                            continue
+                        i = idx[0]
+                        for col in editable_cols:
+                            if col in row.index and col in base.columns:
+                                val = row[col]
+                                if col == "certificate_no" and _is_blank_cert(val):
+                                    val = None
+                                elif col == "certificate_no" and val is not None:
+                                    val = str(val).strip()
+                                base.at[i, col] = val
+                    base = base.drop(columns=["_row_id"], errors="ignore")
+                    st.session_state.inventory = _normalize_df(base)
+                    msg = save_master_excel(st.session_state.inventory)
+                    st.session_state.github_status = msg
+                    st.info(msg)
+                    st.rerun()
 
         st.markdown("#### Download")
         d1, d2, d3 = st.columns(3)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # strip helper cols for download
+        inv_dl = st.session_state.inventory
+        filt_dl = filtered.drop(columns=["_row_id"], errors="ignore")
         with d1:
             st.download_button(
                 "📥 Master Excel (all)",
-                data=_df_to_excel_bytes(inv),
+                data=_df_to_excel_bytes(inv_dl),
                 file_name=f"master_diamonds_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
@@ -425,7 +613,7 @@ with tab_inventory:
         with d2:
             st.download_button(
                 "📥 Master CSV (all)",
-                data=_df_to_csv_bytes(inv),
+                data=_df_to_csv_bytes(inv_dl),
                 file_name=f"master_diamonds_{ts}.csv",
                 mime="text/csv",
                 use_container_width=True,
@@ -433,7 +621,7 @@ with tab_inventory:
         with d3:
             st.download_button(
                 "📥 Filtered Excel",
-                data=_df_to_excel_bytes(filtered),
+                data=_df_to_excel_bytes(filt_dl[display_cols] if not filt_dl.empty else filt_dl),
                 file_name=f"filtered_diamonds_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
