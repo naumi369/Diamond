@@ -13,6 +13,7 @@ Deploy: push this folder to GitHub and connect it at share.streamlit.io
 from __future__ import annotations
 
 import hashlib
+import re
 import io
 import sys
 import tempfile
@@ -41,6 +42,7 @@ from github_storage import (  # noqa: E402
     save_master_excel,
     save_ui_prefs,
 )
+from cert_links import official_links  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -49,7 +51,53 @@ st.set_page_config(
     page_title="Diamond Inventory Compiler",
     page_icon="💎",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
+)
+
+# Mobile-friendly CSS
+st.markdown(
+    """
+    <style>
+    /* Base touch-friendly controls */
+    button, .stDownloadButton button, [data-testid="stCheckbox"] {
+        min-height: 2.5rem !important;
+    }
+    /* Reduce padding on small screens */
+    @media (max-width: 768px) {
+        .block-container {
+            padding-left: 0.6rem !important;
+            padding-right: 0.6rem !important;
+            padding-top: 0.8rem !important;
+            max-width: 100% !important;
+        }
+        h1 { font-size: 1.35rem !important; }
+        h2, h3 { font-size: 1.1rem !important; }
+        /* Tabs: allow horizontal scroll */
+        [data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.25rem;
+            overflow-x: auto;
+            flex-wrap: nowrap !important;
+        }
+        [data-testid="stTabs"] button {
+            white-space: nowrap;
+            font-size: 0.85rem !important;
+            padding: 0.4rem 0.6rem !important;
+        }
+        /* Metrics stack more tightly */
+        [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+        /* Data editor / dataframes: enable horizontal swipe */
+        [data-testid="stDataFrame"],
+        [data-testid="stDataEditor"] {
+            overflow-x: auto !important;
+        }
+        /* Sidebar: already collapsed; widen when open */
+        section[data-testid="stSidebar"] {
+            min-width: 18rem !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
@@ -72,6 +120,146 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].astype("string")
     return df
 
+
+
+
+def _token_matches_row(token: str, row: pd.Series) -> bool:
+    """Match one search token against a row.
+
+    Supports:
+      - plain text substring (shape, color, cert, etc.)
+      - wildcards * and ?  (e.g. 0.5*  SI*  OV*)
+      - weight-aware: 0.5 / 0.5* / 0.50-0.59  match carat values
+    """
+    token = (token or "").strip().lower()
+    if not token:
+        return True
+
+    # Weight range: 0.50-0.59
+    m_range = re.match(r"^(\d+(?:\.\d+)?+)\s*-\s*(\d+(?:\.\d+)?+)$", token)
+    if m_range and "weight" in row.index:
+        try:
+            lo, hi = float(m_range.group(1)), float(m_range.group(2))
+            w = row.get("weight")
+            if w is not None and not (isinstance(w, float) and pd.isna(w)):
+                return lo <= float(w) <= hi
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    # Weight prefix / wildcard on a number-like token: 0.5, 0.5*, 0.50*
+    m_wt = re.match(r"^(\d+(?:\.\d+)*)(\*?)$", token)
+    if m_wt and "weight" in row.index:
+        prefix = m_wt.group(1)
+        has_star = m_wt.group(2) == "*"
+        try:
+            w = row.get("weight")
+            if w is not None and not (isinstance(w, float) and pd.isna(w)):
+                wf = float(w)
+                # formats that should match "0.5" / "0.5*"
+                variants = {
+                    f"{wf}",
+                    f"{wf:.1f}",
+                    f"{wf:.2f}",
+                    f"{wf:.3f}",
+                    f"{wf:.2f}".rstrip("0").rstrip("."),
+                }
+                # also integer-ish
+                if wf == int(wf):
+                    variants.add(str(int(wf)))
+                if has_star or prefix.count(".") <= 1:
+                    for v in variants:
+                        if v.startswith(prefix) or prefix.startswith(v):
+                            # 0.5 should match 0.50, 0.51, 0.52
+                            if v.startswith(prefix):
+                                return True
+                        # prefix 0.5 vs value 0.51 → value string starts with 0.5
+                        if v.startswith(prefix):
+                            return True
+                    # Compare numerically for prefix like 0.5 → [0.50, 0.5999...)
+                    try:
+                        p = float(prefix)
+                        # number of decimal places in prefix
+                        dec = len(prefix.split(".")[1]) if "." in prefix else 0
+                        step = 10 ** (-dec) if dec > 0 else 1.0
+                        # For "0.5" / "0.5*" treat as 0.50–0.5999… when one decimal
+                        if has_star or dec >= 1:
+                            lo = p
+                            hi = p + step - 1e-12
+                            if lo <= wf <= hi + (0 if not has_star and dec >= 2 else 0):
+                                # broader: any weight whose rounded string starts with prefix
+                                pass
+                        if any(f"{wf:.3f}".startswith(prefix) or f"{wf:.2f}".startswith(prefix) or f"{wf}".startswith(prefix) for _ in [0]):
+                            return True
+                        # Final numeric bucket: 0.5* → 0.5 <= w < 0.6
+                        if has_star:
+                            lo = p
+                            hi = p + (10 ** (-len(prefix.split(".")[1])) if "." in prefix else 1) - 1e-9
+                            return lo <= wf < (p + (0.1 if dec == 1 else (0.01 if dec == 2 else 1)))
+                        # plain 0.5 without star: still match 0.50–0.59 family for 1 decimal
+                        if dec == 1:
+                            return p <= wf < p + 0.1
+                        if dec >= 2:
+                            return abs(wf - p) < 1e-6
+                    except ValueError:
+                        pass
+        except (TypeError, ValueError):
+            pass
+
+    # General wildcard match against all cell values
+    pattern = token
+    if "*" in pattern or "?" in pattern:
+        # convert glob to regex
+        rx = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+        regex = re.compile(r"^" + rx + r"$|.*" + rx + r".*", re.I)
+        # simpler: use fnmatch-style on blob and each cell
+        import fnmatch
+        for v in row.values:
+            if v is None:
+                continue
+            try:
+                if isinstance(v, float) and pd.isna(v):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            s = str(v).strip().lower()
+            if fnmatch.fnmatch(s, pattern) or fnmatch.fnmatch(s, f"*{pattern}*"):
+                return True
+            # weight cells as fixed decimals
+            try:
+                fv = float(v)
+                for fmt in (f"{fv:.2f}", f"{fv:.1f}", f"{fv:.3f}", f"{fv}"):
+                    if fnmatch.fnmatch(fmt, pattern) or fnmatch.fnmatch(fmt, pattern.rstrip("*") + "*"):
+                        return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
+    # Plain substring across row
+    parts = []
+    for v in row.values:
+        if v is None:
+            continue
+        try:
+            if isinstance(v, float) and pd.isna(v):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, float):
+            parts.append(f"{v:.2f}")
+            parts.append(f"{v:.1f}")
+            parts.append(str(v))
+        else:
+            parts.append(str(v))
+    blob = " ".join(parts).lower()
+    return token in blob
+
+
+def _row_matches_search(row: pd.Series, query: str) -> bool:
+    tokens = [t for t in (query or "").split() if t.strip()]
+    if not tokens:
+        return True
+    return all(_token_matches_row(t, row) for t in tokens)
 
 
 def _apply_editor_changes(base: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
@@ -530,9 +718,16 @@ with tab_inventory:
 
         # ---- Search + filters (every column) ----
         st.subheader("Search & filters")
+        view_mode = st.radio(
+            "View",
+            ["📱 Mobile cards", "🖥️ Table editor"],
+            horizontal=True,
+            key="inv_view_mode",
+            help="Mobile cards are easier on phones. Table editor is better on desktop.",
+        )
         search = st.text_input(
             "🔍 Search all columns (keywords, certificate, stock, shape, links…)",
-            placeholder="e.g. oval SI1  or  1535750439  or  GIA",
+            placeholder="e.g. round 0.5*   or  oval SI1   or  0.50-0.55",
             key="inv_search",
         )
 
@@ -565,13 +760,9 @@ with tab_inventory:
         # Apply filters
         filtered = inv.copy()
         if search and search.strip():
-            tokens = [t.strip().lower() for t in search.split() if t.strip()]
-            # every token must appear somewhere in the row (AND across tokens)
-            def row_match(row) -> bool:
-                blob = " ".join("" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v) for v in row.values).lower()
-                return all(tok in blob for tok in tokens)
-
-            filtered = filtered[filtered.apply(row_match, axis=1)]
+            filtered = filtered[
+                filtered.apply(lambda r: _row_matches_search(r, search.strip()), axis=1)
+            ]
 
         if sel_shape:
             filtered = filtered[filtered["shape"].astype(str).isin(sel_shape)]
@@ -739,49 +930,131 @@ with tab_inventory:
         )
         editor_df = edit_df[[c for c in editor_cols if c in edit_df.columns]].copy()
 
-        st.markdown(
-            "Edit **Certificate #** (and other fields) directly in the grid. "
-            "Then click **Apply edits** to save into the inventory."
-        )
-        edited = st.data_editor(
-            editor_df,
-            use_container_width=True,
-            height=480,
-            hide_index=True,
-            num_rows="fixed",
-            column_config=column_config,
-            column_order=["Missing Cert"] + ordered_display,
-            disabled=[c for c in editor_df.columns if c not in (
-                "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
-                "polish", "symmetry", "fluorescence", "cut", "notes",
-                "video_link", "image_link", "certificate_link", "mm_size",
-            )],
-            key="inventory_editor",
-        )
+        edited = editor_df  # default; overwritten by data_editor on desktop
 
-        c_apply, c_save = st.columns(2)
-        with c_apply:
-            if st.button("✅ Apply edits to inventory", type="primary", use_container_width=True):
-                base = _apply_editor_changes(st.session_state.inventory, edited)
-                st.session_state.inventory = _normalize_df(base)
-                still = int(
-                    st.session_state.inventory["certificate_no"].map(_is_blank_cert).sum()
+        if view_mode.startswith("📱"):
+            st.caption("Tap a certificate link to open the official GIA/IGI page (PDF download on their site).")
+            max_cards = st.slider("Cards to show", 5, 50, 15, key="mobile_card_limit")
+            show = filtered.head(max_cards)
+            for _, row in show.iterrows():
+                cert = clean_value(row.get("certificate_no"))
+                lab = clean_value(row.get("lab")) or ""
+                miss = _is_blank_cert(cert)
+                title_bits = [
+                    f"{row.get('shape') or '?'}",
+                    f"{row.get('weight') or '?'} ct",
+                    f"{row.get('color') or ''}",
+                    f"{row.get('clarity') or ''}",
+                ]
+                header = " · ".join(str(x) for x in title_bits if x)
+                with st.container(border=True):
+                    if miss:
+                        st.markdown(f"**🔴 {header}** — *Certificate # missing*")
+                        new_cert = st.text_input(
+                            "Enter Certificate #",
+                            value="",
+                            key=f"mob_cert_{row.get('_row_id')}",
+                        )
+                        if new_cert and st.button("Save cert", key=f"mob_save_{row.get('_row_id')}"):
+                            base = st.session_state.inventory.copy()
+                            base["_row_id"] = range(len(base))
+                            rid = int(row["_row_id"])
+                            base.loc[base["_row_id"] == rid, "certificate_no"] = clean_value(new_cert)
+                            base = base.drop(columns=["_row_id"], errors="ignore")
+                            st.session_state.inventory = _normalize_df(base)
+                            st.rerun()
+                    else:
+                        st.markdown(f"**{header}**")
+                        st.caption(f"Cert: `{cert}` · Lab: {lab or '—'} · Stock: {clean_value(row.get('stock_no')) or '—'}")
+                        open_url, pdf_url, note = official_links(lab, cert)
+                        b1, b2 = st.columns(2)
+                        if open_url:
+                            b1.link_button("🔎 Official report", open_url, use_container_width=True)
+                        if pdf_url:
+                            b2.link_button("📄 PDF (IGI)", pdf_url, use_container_width=True)
+                        elif open_url and (lab or "").upper().find("GIA") >= 0:
+                            b2.caption("PDF: use Download on GIA page")
+                        if is_url(row.get("video_link")):
+                            st.link_button("🎬 Video", str(row.get("video_link")), use_container_width=True)
+            st.info(
+                "GIA certificates: opens **Report Check** — click their PDF download there. "
+                "Direct bulk GIA PDF API requires a GIA lab account (Report Check Plus). "
+                "IGI: PDF button tries the public IGI PDF link."
+            )
+        else:
+            st.markdown(
+                "Edit **Certificate #** (and other fields) directly in the grid. "
+                "Then click **Apply edits** to save into the inventory."
+            )
+            # Official cert links column for filtered rows (desktop)
+            with st.expander("🔗 Official certificate links (GIA / IGI)", expanded=False):
+                st.caption(
+                    "GIA → Report Check (download PDF on gia.edu). "
+                    "IGI → public PDF link when available."
                 )
-                if still:
-                    st.warning(f"Edits applied. **{still}** stone(s) still missing Certificate #.")
-                else:
-                    st.success("Edits applied. All stones have a Certificate #.")
-                st.rerun()
+                link_rows = []
+                for _, row in filtered.head(100).iterrows():
+                    cert = clean_value(row.get("certificate_no"))
+                    lab = clean_value(row.get("lab"))
+                    open_url, pdf_url, note = official_links(lab, cert)
+                    link_rows.append({
+                        "certificate_no": cert or "",
+                        "lab": lab or "",
+                        "report_page": open_url or "",
+                        "pdf_link": pdf_url or "",
+                        "note": note,
+                    })
+                if link_rows:
+                    st.dataframe(
+                        pd.DataFrame(link_rows),
+                        use_container_width=True,
+                        height=240,
+                        column_config={
+                            "report_page": st.column_config.LinkColumn("Report page"),
+                            "pdf_link": st.column_config.LinkColumn("PDF"),
+                        },
+                        hide_index=True,
+                    )
 
-        with c_save:
-            if github_configured():
-                if st.button("💾 Apply edits & save to GitHub", use_container_width=True):
+            edited = st.data_editor(
+                editor_df,
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+                num_rows="fixed",
+                column_config=column_config,
+                column_order=["Missing Cert"] + ordered_display,
+                disabled=[c for c in editor_df.columns if c not in (
+                    "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
+                    "polish", "symmetry", "fluorescence", "cut", "notes",
+                    "video_link", "image_link", "certificate_link", "mm_size",
+                )],
+                key="inventory_editor",
+            )
+
+            c_apply, c_save = st.columns(2)
+            with c_apply:
+                if st.button("✅ Apply edits to inventory", type="primary", use_container_width=True):
                     base = _apply_editor_changes(st.session_state.inventory, edited)
                     st.session_state.inventory = _normalize_df(base)
-                    msg = save_master_excel(st.session_state.inventory)
-                    st.session_state.github_status = msg
-                    st.info(msg)
+                    still = int(
+                        st.session_state.inventory["certificate_no"].map(_is_blank_cert).sum()
+                    )
+                    if still:
+                        st.warning(f"Edits applied. **{still}** stone(s) still missing Certificate #.")
+                    else:
+                        st.success("Edits applied. All stones have a Certificate #.")
                     st.rerun()
+
+            with c_save:
+                if github_configured():
+                    if st.button("💾 Apply edits & save to GitHub", use_container_width=True):
+                        base = _apply_editor_changes(st.session_state.inventory, edited)
+                        st.session_state.inventory = _normalize_df(base)
+                        msg = save_master_excel(st.session_state.inventory)
+                        st.session_state.github_status = msg
+                        st.info(msg)
+                        st.rerun()
 
         st.markdown("#### Download")
         d1, d2, d3 = st.columns(3)
