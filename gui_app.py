@@ -478,23 +478,44 @@ with tab_inventory:
         display_cols = [c for c in STANDARD_COLUMNS if c in filtered.columns]
         edit_df = filtered[display_cols + ["_row_id"]].copy()
 
+        def _as_str(v):
+            if v is None:
+                return ""
+            try:
+                if pd.isna(v):
+                    return ""
+            except (TypeError, ValueError):
+                pass
+            # avoid "12345.0" for cert-like numbers
+            if isinstance(v, float) and v == int(v):
+                return str(int(v))
+            return str(v)
+
+        # Coerce types so data_editor / Arrow never sees mixed object columns
+        numeric_cols = {"weight", "price_per_ct", "amount"}
+        for col in list(edit_df.columns):
+            if col == "_row_id":
+                edit_df[col] = pd.to_numeric(edit_df[col], errors="coerce").astype("int64")
+            elif col in numeric_cols:
+                edit_df[col] = pd.to_numeric(edit_df[col], errors="coerce")
+            else:
+                edit_df[col] = edit_df[col].map(_as_str).astype("string")
+
         # Highlight helper: mark missing cert rows with a visible flag column
-        edit_df.insert(
-            0,
-            "⚠ Missing Cert",
-            edit_df["certificate_no"].map(lambda v: "YES — enter below" if _is_blank_cert(v) else ""),
+        miss_flags = edit_df["certificate_no"].map(
+            lambda v: "YES — enter below" if _is_blank_cert(v) else ""
         )
+        edit_df.insert(0, "Missing Cert", miss_flags.astype("string"))
 
         column_config = {
-            "⚠ Missing Cert": st.column_config.TextColumn(
-                "⚠ Missing Cert",
+            "Missing Cert": st.column_config.TextColumn(
+                "Missing Cert",
                 disabled=True,
                 width="small",
-                help="Highlighted when Certificate # is blank",
+                help="Filled when Certificate # is blank",
             ),
             "certificate_no": st.column_config.TextColumn(
                 "Certificate #",
-                required=False,
                 help="Mandatory — enter GIA/IGI report number",
                 width="medium",
             ),
@@ -505,10 +526,10 @@ with tab_inventory:
             "video_link": st.column_config.TextColumn("Video link", width="medium"),
             "image_link": st.column_config.TextColumn("Image link", width="medium"),
             "certificate_link": st.column_config.TextColumn("Cert link", width="medium"),
+            "_row_id": st.column_config.NumberColumn("_row_id", disabled=True),
         }
 
-        # column order without technical id
-        col_order = ["⚠ Missing Cert"] + [c for c in display_cols]
+        col_order = ["Missing Cert"] + [c for c in display_cols]
 
         st.markdown(
             "Edit **Certificate #** (and other fields) directly in the grid. "
