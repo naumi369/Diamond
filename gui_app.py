@@ -192,13 +192,52 @@ if "github_loaded" not in st.session_state:
     st.session_state.github_loaded = False
 if "github_status" not in st.session_state:
     st.session_state.github_status = ""
-if "column_order" not in st.session_state:
-    st.session_state.column_order = [
+def _default_visible_columns():
+    return [
         "certificate_no", "stock_no", "shape", "weight", "color", "clarity",
         "mm_size", "lab", "polish", "symmetry", "fluorescence", "cut",
         "price_per_ct", "amount", "video_link", "image_link",
         "certificate_link", "source_file", "notes",
     ]
+
+
+def _default_column_widths():
+    # Streamlit accepts "small" | "medium" | "large" | pixel int
+    return {
+        "certificate_no": "medium",
+        "stock_no": "medium",
+        "shape": "small",
+        "weight": "small",
+        "color": "small",
+        "clarity": "small",
+        "mm_size": "medium",
+        "lab": "small",
+        "price_per_ct": "small",
+        "amount": "small",
+        "video_link": "medium",
+        "source_file": "medium",
+        "notes": "medium",
+    }
+
+
+def _save_layout_prefs():
+    """Persist visible columns + widths to session and GitHub."""
+    prefs = {
+        "column_order": list(st.session_state.visible_columns),
+        "column_widths": dict(st.session_state.column_widths),
+    }
+    if github_configured():
+        return save_ui_prefs(prefs)
+    return "Layout saved for this session only (configure GitHub to keep after restart)."
+
+
+if "visible_columns" not in st.session_state:
+    st.session_state.visible_columns = _default_visible_columns()
+if "column_widths" not in st.session_state:
+    st.session_state.column_widths = _default_column_widths()
+# back-compat alias
+if "column_order" not in st.session_state:
+    st.session_state.column_order = list(st.session_state.visible_columns)
 if "prefs_loaded" not in st.session_state:
     st.session_state.prefs_loaded = False
 
@@ -216,11 +255,16 @@ if not st.session_state.prefs_loaded:
         prefs = load_ui_prefs()
         saved_order = prefs.get("column_order")
         if isinstance(saved_order, list) and saved_order:
+            # ONLY columns listed here stay visible — do not re-add the rest
             known = [c for c in saved_order if c in STANDARD_COLUMNS]
-            for c in STANDARD_COLUMNS:
-                if c not in known:
-                    known.append(c)
-            st.session_state.column_order = known
+            if known:
+                st.session_state.visible_columns = known
+                st.session_state.column_order = known
+        saved_widths = prefs.get("column_widths")
+        if isinstance(saved_widths, dict) and saved_widths:
+            widths = _default_column_widths()
+            widths.update({k: v for k, v in saved_widths.items() if isinstance(v, (str, int))})
+            st.session_state.column_widths = widths
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -599,67 +643,115 @@ with tab_inventory:
             "_row_id": st.column_config.NumberColumn("_row_id", disabled=True),
         }
 
-        # Build column order from saved prefs (Missing Cert always first)
-        preferred = st.session_state.column_order
+        # Visible columns only (hidden ones are NOT re-added)
+        preferred = list(st.session_state.visible_columns)
         ordered_display = [c for c in preferred if c in display_cols]
-        for c in display_cols:
-            if c not in ordered_display:
-                ordered_display.append(c)
+        # Always keep certificate_no visible if it exists (mandatory field)
+        if "certificate_no" in display_cols and "certificate_no" not in ordered_display:
+            ordered_display.insert(0, "certificate_no")
         col_order = ["Missing Cert"] + ordered_display
 
-        with st.expander("⚙️ Column order (saved on GitHub)", expanded=False):
+        widths = st.session_state.column_widths
+
+        def _width_for(col: str):
+            return widths.get(col, "medium")
+
+        # Rebuild key column configs with persisted widths
+        column_config["Missing Cert"] = st.column_config.TextColumn(
+            "🔴", disabled=True, width="small",
+            help="Red mark = Certificate # is missing",
+        )
+        column_config["certificate_no"] = st.column_config.TextColumn(
+            "Certificate #", width=_width_for("certificate_no"),
+            help="Mandatory — enter GIA/IGI report number",
+        )
+        column_config["stock_no"] = st.column_config.TextColumn(
+            "Stock #", width=_width_for("stock_no"),
+        )
+        for _c in ("shape", "color", "clarity", "lab", "polish", "symmetry",
+                    "fluorescence", "cut", "mm_size", "notes", "source_file",
+                    "video_link", "image_link", "certificate_link"):
+            if _c in display_cols:
+                column_config[_c] = st.column_config.TextColumn(
+                    _c.replace("_", " ").title(), width=_width_for(_c),
+                )
+        for _c, _label in (("weight", "Weight"), ("price_per_ct", "Price/ct"), ("amount", "Amount")):
+            if _c in display_cols:
+                column_config[_c] = st.column_config.NumberColumn(
+                    _label, format="%.2f", width=_width_for(_c),
+                )
+
+        with st.expander("⚙️ Columns & widths (saved on GitHub)", expanded=False):
             st.caption(
-                "Pick columns in the order you want them to appear. "
-                "Click **Save column order** so it is remembered after restart."
+                "Uncheck a column to **hide** it. Reorder by clearing and selecting in the order you want. "
+                "Widths: small / medium / large. Click **Save layout** so it survives reload."
             )
             new_order = st.multiselect(
-                "Visible column order",
+                "Visible columns (order = left → right)",
                 options=list(STANDARD_COLUMNS),
-                default=[c for c in st.session_state.column_order if c in STANDARD_COLUMNS],
-                help="Order of selection = left-to-right order in the table",
+                default=[c for c in st.session_state.visible_columns if c in STANDARD_COLUMNS],
+                help="Deselect to hide. Selection order = table order.",
                 key="col_order_picker",
             )
+            st.markdown("**Column widths**")
+            width_choices = ["small", "medium", "large"]
+            # show width selectors for currently selected columns
+            show_for = new_order if new_order else st.session_state.visible_columns
+            wcols = st.columns(4)
+            updated_widths = dict(st.session_state.column_widths)
+            for i, col in enumerate(show_for):
+                with wcols[i % 4]:
+                    cur = str(updated_widths.get(col, "medium"))
+                    if cur not in width_choices:
+                        cur = "medium"
+                    updated_widths[col] = st.selectbox(
+                        col,
+                        width_choices,
+                        index=width_choices.index(cur),
+                        key=f"width_{col}",
+                    )
+
             b1, b2 = st.columns(2)
             with b1:
-                if st.button("💾 Save column order", use_container_width=True):
-                    if new_order:
-                        # append any missing standard cols at end
-                        full = list(new_order)
-                        for c in STANDARD_COLUMNS:
-                            if c not in full:
-                                full.append(c)
-                        st.session_state.column_order = full
-                        if github_configured():
-                            msg = save_ui_prefs({"column_order": full})
-                            st.success(msg)
-                        else:
-                            st.success("Column order saved for this session (configure GitHub to keep it after restart).")
+                if st.button("💾 Save layout", type="primary", use_container_width=True):
+                    if not new_order:
+                        st.error("Select at least one column (Certificate # recommended).")
+                    else:
+                        # Do NOT auto-append hidden columns — hidden stays hidden
+                        st.session_state.visible_columns = list(new_order)
+                        st.session_state.column_order = list(new_order)
+                        st.session_state.column_widths = updated_widths
+                        msg = _save_layout_prefs()
+                        st.success(msg)
                         st.rerun()
             with b2:
-                if st.button("↺ Reset default order", use_container_width=True):
-                    st.session_state.column_order = [
-                        "certificate_no", "stock_no", "shape", "weight", "color", "clarity",
-                        "mm_size", "lab", "polish", "symmetry", "fluorescence", "cut",
-                        "price_per_ct", "amount", "video_link", "image_link",
-                        "certificate_link", "source_file", "notes",
-                    ]
-                    if github_configured():
-                        save_ui_prefs({"column_order": st.session_state.column_order})
+                if st.button("↺ Reset layout defaults", use_container_width=True):
+                    st.session_state.visible_columns = _default_visible_columns()
+                    st.session_state.column_order = list(st.session_state.visible_columns)
+                    st.session_state.column_widths = _default_column_widths()
+                    msg = _save_layout_prefs()
+                    st.success(msg)
                     st.rerun()
+
+        # Only pass visible columns (+ helpers) into the editor
+        editor_cols = ["Missing Cert"] + ordered_display + (
+            ["_row_id"] if "_row_id" in edit_df.columns else []
+        )
+        editor_df = edit_df[[c for c in editor_cols if c in edit_df.columns]].copy()
 
         st.markdown(
             "Edit **Certificate #** (and other fields) directly in the grid. "
             "Then click **Apply edits** to save into the inventory."
         )
         edited = st.data_editor(
-            edit_df,
+            editor_df,
             use_container_width=True,
             height=480,
             hide_index=True,
             num_rows="fixed",
             column_config=column_config,
-            column_order=col_order,
-            disabled=[c for c in edit_df.columns if c not in (
+            column_order=["Missing Cert"] + ordered_display,
+            disabled=[c for c in editor_df.columns if c not in (
                 "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
                 "polish", "symmetry", "fluorescence", "cut", "notes",
                 "video_link", "image_link", "certificate_link", "mm_size",
