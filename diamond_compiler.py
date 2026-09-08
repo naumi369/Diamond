@@ -191,8 +191,21 @@ def to_float(val: Any) -> Optional[float]:
         return None
 
 
-def is_url(s: Optional[str]) -> bool:
-    if not s:
+def is_url(s: Any) -> bool:
+    """Return True only for real http(s) URL strings."""
+    if s is None:
+        return False
+    # pandas NaN / NA
+    try:
+        if pd.isna(s):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if not isinstance(s, str):
+        s = str(s).strip()
+    else:
+        s = s.strip()
+    if not s or s.lower() in ("nan", "none", "null", "<na>", "nat"):
         return False
     return s.startswith("http://") or s.startswith("https://")
 

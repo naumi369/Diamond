@@ -33,6 +33,11 @@ from diamond_compiler import (  # noqa: E402
     download_videos,
     is_url,
 )
+from github_storage import (  # noqa: E402
+    is_configured as github_configured,
+    load_master_excel,
+    save_master_excel,
+)
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -125,6 +130,18 @@ if "video_dir" not in st.session_state:
     st.session_state.video_dir = str(
         Path(__file__).resolve().parent / "output" / "videos"
     )
+if "github_loaded" not in st.session_state:
+    st.session_state.github_loaded = False
+if "github_status" not in st.session_state:
+    st.session_state.github_status = ""
+
+# Auto-load master inventory from GitHub once when secrets are present
+if not st.session_state.github_loaded and github_configured():
+    df_gh, msg = load_master_excel()
+    st.session_state.github_status = msg
+    st.session_state.github_loaded = True
+    if df_gh is not None and not df_gh.empty:
+        st.session_state.inventory = _normalize_df(df_gh)
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -132,31 +149,65 @@ if "video_dir" not in st.session_state:
 with st.sidebar:
     st.title("💎 Diamond Compiler")
     st.markdown("---")
+
+    # GitHub cloud status
+    if github_configured():
+        st.success("☁️ GitHub storage connected")
+        if st.session_state.github_status:
+            st.caption(st.session_state.github_status)
+        n = len(st.session_state.inventory)
+        st.metric("Stones in inventory", n)
+        if st.button("💾 Save inventory to GitHub", type="primary", use_container_width=True):
+            with st.spinner("Saving to GitHub…"):
+                msg = save_master_excel(st.session_state.inventory)
+            st.session_state.github_status = msg
+            st.info(msg)
+        if st.button("🔄 Reload from GitHub", use_container_width=True):
+            df_gh, msg = load_master_excel()
+            st.session_state.github_status = msg
+            if df_gh is not None and not df_gh.empty:
+                st.session_state.inventory = _normalize_df(df_gh)
+                st.success(msg)
+            else:
+                st.warning(msg)
+            st.rerun()
+    else:
+        st.warning("☁️ GitHub not configured")
+        with st.expander("How to save inventory on Cloud", expanded=True):
+            st.markdown(
+                """
+Add these **Secrets** in Streamlit Cloud  
+(App → Settings → Secrets):
+
+```toml
+GITHUB_TOKEN = "ghp_your_token_here"
+GITHUB_REPO  = "youruser/your-repo"
+GITHUB_BRANCH = "main"
+GITHUB_PATH  = "data/master_diamonds.xlsx"
+```
+
+Create a GitHub **Personal Access Token** (classic) with the `repo` scope.
+Then the app can load & save the master Excel in your repo automatically.
+                """
+            )
+
+    st.markdown("---")
     st.markdown(
-        "**How to keep building inventory**\n\n"
-        "1. Upload new Excel sheets on the **Upload** tab\n"
-        "2. Stones are **added** to the inventory (duplicates removed)\n"
-        "3. Download the **Master Excel** regularly\n"
-        "4. Next session: re-upload that Master Excel + new sheets\n"
+        "**Workflow**\n\n"
+        "1. Upload new customer sheets\n"
+        "2. Click **Process & Add**\n"
+        "3. Click **Save inventory to GitHub**\n"
+        "4. Next visit: inventory loads from GitHub automatically"
     )
     st.markdown("---")
-    with st.expander("☁️ Streamlit Cloud notes", expanded=False):
+    with st.expander("Video files note"):
         st.markdown(
-            """
-**Videos cannot be stored permanently on Streamlit Cloud.**
-The platform wipes the disk when the app sleeps or restarts.
-
-- Video **links** are kept in the inventory table
-- On Cloud, open videos in the browser via the link
-- For actual file downloads, run the app **locally**
-
-**Inventory persistence on Cloud:**
-Session memory is lost on restart. Always download the Master Excel
-and re-upload it next time.
-            """
+            "Video **files** cannot stay on Streamlit Cloud (disk is temporary). "
+            "Video **links** are stored in the inventory. "
+            "Download files only when running locally."
         )
     st.markdown("---")
-    if st.button("🗑️ Clear inventory", use_container_width=True):
+    if st.button("🗑️ Clear inventory (session only)", use_container_width=True):
         st.session_state.inventory = _empty_inventory()
         st.session_state.last_logs = []
         st.rerun()
@@ -300,6 +351,17 @@ with tab_upload:
         st.success(f"Inventory now has **{len(st.session_state.inventory)}** unique stones.")
         for line in logs:
             st.text(line)
+
+        # Auto-save to GitHub when configured
+        if github_configured():
+            with st.spinner("Saving updated inventory to GitHub…"):
+                msg = save_master_excel(st.session_state.inventory)
+            st.session_state.github_status = msg
+            st.info(msg)
+        else:
+            st.caption(
+                "Tip: configure GitHub secrets so the inventory is saved on Cloud automatically."
+            )
 
     if st.session_state.last_logs and not st.session_state.inventory.empty:
         with st.expander("Last processing log"):

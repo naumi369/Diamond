@@ -2,64 +2,64 @@
 
 Compile miscellaneous customer/supplier diamond Excel lists into one clean inventory.
 
-Works **locally** and on **Streamlit Community Cloud**.
+Works **locally** and on **Streamlit Community Cloud**, with optional **GitHub persistence** so you do not need to keep files on your computer.
 
 ## Features
 
-- **Upload & Add** – keep uploading new sheets; stones are merged and de-duplicated
-- **Full Inventory** – filterable table + download Master Excel / CSV
-- **Summary** – KPIs, charts, shape×color pivot, multi-sheet summary workbook
-- Video links stored; actual video files downloadable **locally only**
+- Upload sheets → merge & de-duplicate
+- **Full Inventory** tab with filters
+- **Summary** dashboard + multi-sheet Excel
+- **Save master inventory on GitHub** (recommended for Cloud)
+
+## Deploy to Streamlit Cloud
+
+1. Push this repo to GitHub
+2. [share.streamlit.io](https://share.streamlit.io) → New app → main file `gui_app.py`
+3. Add **Secrets** (App → ⚙️ Settings → Secrets):
+
+```toml
+GITHUB_TOKEN = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+GITHUB_REPO  = "yourusername/your-repo-name"
+GITHUB_BRANCH = "main"
+GITHUB_PATH  = "data/master_diamonds.xlsx"
+```
+
+### Create the GitHub token
+
+1. GitHub → Settings → Developer settings → Personal access tokens → **Tokens (classic)**
+2. Generate new token with the **`repo`** scope
+3. Paste it into Streamlit Secrets as `GITHUB_TOKEN`
+
+After that:
+
+- App **loads** `data/master_diamonds.xlsx` from the repo on startup
+- After you process new sheets, it **auto-saves** the merged inventory back to GitHub
+- You can also click **Save inventory to GitHub** / **Reload from GitHub** in the sidebar
+
+No need to download or re-upload the master file yourself.
 
 ## Run locally
 
 ```bash
-cd diamond_compiler
 pip install -r requirements.txt
 streamlit run gui_app.py
 ```
 
-## Deploy to Streamlit Cloud
+(Optional) set the same secrets in `.streamlit/secrets.toml` for local GitHub save.
 
-1. Push this folder to a **public GitHub repo** (or private if you have Streamlit team plan)
-2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
-3. Select the repo, branch, and set **Main file path** to `gui_app.py`
-4. Deploy
+## Video files
 
-`requirements.txt` is already set for Cloud.
-
-### Important Cloud limitations
-
-| Topic | Reality on Streamlit Cloud |
-|-------|----------------------------|
-| **Video files** | **Cannot be stored permanently.** Disk is wiped when the app sleeps. Video *links* stay in the table; open them in a browser. For real file downloads, run locally. |
-| **Inventory persistence** | Session memory is lost on restart. **Always download the Master Excel** and re-upload it next time together with new sheets. |
-| **File size** | Keep individual Excel uploads reasonable (< 200 MB total per session is safer). |
-
-## Recommended workflow (Cloud or local)
-
-1. Upload any previous **Master Excel** (optional first time)
-2. Upload new customer sheets
-3. Click **Process & Add to Inventory**
-4. Review **Full Inventory** and **Summary** tabs
-5. Download **Master Excel** and keep it safe
-6. Next batch: upload that Master + the new sheets again
-
-Duplicates are removed automatically (by certificate number, then stock number).
-
-## CLI (no GUI)
-
-```bash
-python diamond_compiler.py --input-dir ./sheets --output-dir ./output --db --download-videos
-```
+Video **links** are stored in the inventory (and on GitHub).  
+Actual video files cannot stay on Streamlit Cloud (temporary disk). Download them only when running locally.
 
 ## Project layout
 
 ```
-diamond_compiler/
-├── gui_app.py              ← Streamlit app (deploy this)
-├── diamond_compiler.py     ← parsing / download engine
+├── gui_app.py              # Streamlit UI
+├── diamond_compiler.py     # Excel parsers
+├── github_storage.py       # Load/save master Excel via GitHub API
+├── data/
+│   └── master_diamonds.xlsx   # created automatically after first save
 ├── requirements.txt
-├── README.md
-└── output/                 ← local results & videos/
+└── README.md
 ```
