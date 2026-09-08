@@ -22,7 +22,7 @@
   ],
   "column_widths": {
     "certificate_no": "medium",
-    "stock_no": "medium",
+    "stock_no": "small",
     "shape": "small",
     "weight": "small",
     "color": "small",
