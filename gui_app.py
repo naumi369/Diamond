@@ -73,6 +73,47 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+def _apply_editor_changes(base: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
+    """Merge data_editor rows back into inventory without dtype errors."""
+    base = base.copy()
+    base["_row_id"] = list(range(len(base)))
+
+    editable_cols = [
+        "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
+        "polish", "symmetry", "fluorescence", "cut", "notes",
+        "video_link", "image_link", "certificate_link", "mm_size",
+    ]
+
+    # Ensure editable columns accept strings / None
+    for col in editable_cols:
+        if col in base.columns:
+            base[col] = base[col].map(clean_value).astype("object")
+
+    if "_row_id" not in edited.columns:
+        return base.drop(columns=["_row_id"], errors="ignore")
+
+    # Map row_id -> position
+    id_to_pos = {int(r): i for i, r in enumerate(base["_row_id"].tolist())}
+
+    for _, row in edited.iterrows():
+        try:
+            rid = int(row["_row_id"])
+        except (TypeError, ValueError):
+            continue
+        if rid not in id_to_pos:
+            continue
+        i = id_to_pos[rid]
+        for col in editable_cols:
+            if col not in edited.columns or col not in base.columns:
+                continue
+            val = row[col]
+            val = clean_value(val)
+            base.iat[i, base.columns.get_loc(col)] = val
+
+    return base.drop(columns=["_row_id"], errors="ignore")
+
+
 def _dedup(df: pd.DataFrame) -> pd.DataFrame:
     """Prefer certificate_no, then stock_no, keep first occurrence."""
     if df.empty:
@@ -629,32 +670,13 @@ with tab_inventory:
         c_apply, c_save = st.columns(2)
         with c_apply:
             if st.button("✅ Apply edits to inventory", type="primary", use_container_width=True):
-                # Merge edited rows back into full inventory by _row_id
-                base = st.session_state.inventory.copy()
-                base["_row_id"] = range(len(base))
-                editable_cols = [
-                    "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
-                    "polish", "symmetry", "fluorescence", "cut", "notes",
-                    "video_link", "image_link", "certificate_link", "mm_size",
-                ]
-                for _, row in edited.iterrows():
-                    rid = row["_row_id"]
-                    idx = base.index[base["_row_id"] == rid]
-                    if len(idx) == 0:
-                        continue
-                    i = idx[0]
-                    for col in editable_cols:
-                        if col in row.index and col in base.columns:
-                            val = row[col]
-                            # normalize blank cert to None
-                            if col in ("certificate_no", "stock_no"):
-                                val = clean_value(val)
-                            base.at[i, col] = val
-                base = base.drop(columns=["_row_id"], errors="ignore")
+                base = _apply_editor_changes(st.session_state.inventory, edited)
                 st.session_state.inventory = _normalize_df(base)
-                still = st.session_state.inventory["certificate_no"].map(_is_blank_cert).sum()
+                still = int(
+                    st.session_state.inventory["certificate_no"].map(_is_blank_cert).sum()
+                )
                 if still:
-                    st.warning(f"Edits applied. **{int(still)}** stone(s) still missing Certificate #.")
+                    st.warning(f"Edits applied. **{still}** stone(s) still missing Certificate #.")
                 else:
                     st.success("Edits applied. All stones have a Certificate #.")
                 st.rerun()
@@ -662,26 +684,7 @@ with tab_inventory:
         with c_save:
             if github_configured():
                 if st.button("💾 Apply edits & save to GitHub", use_container_width=True):
-                    base = st.session_state.inventory.copy()
-                    base["_row_id"] = range(len(base))
-                    editable_cols = [
-                        "certificate_no", "stock_no", "lab", "shape", "color", "clarity",
-                        "polish", "symmetry", "fluorescence", "cut", "notes",
-                        "video_link", "image_link", "certificate_link", "mm_size",
-                    ]
-                    for _, row in edited.iterrows():
-                        rid = row["_row_id"]
-                        idx = base.index[base["_row_id"] == rid]
-                        if len(idx) == 0:
-                            continue
-                        i = idx[0]
-                        for col in editable_cols:
-                            if col in row.index and col in base.columns:
-                                val = row[col]
-                                if col in ("certificate_no", "stock_no"):
-                                    val = clean_value(val)
-                                base.at[i, col] = val
-                    base = base.drop(columns=["_row_id"], errors="ignore")
+                    base = _apply_editor_changes(st.session_state.inventory, edited)
                     st.session_state.inventory = _normalize_df(base)
                     msg = save_master_excel(st.session_state.inventory)
                     st.session_state.github_status = msg
